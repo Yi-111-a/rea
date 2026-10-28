@@ -14,6 +14,8 @@ export interface OwnedWorkerRuntimeOptions {
   readonly rootPrefix: string;
   readonly launcher?: typeof spawnOwnedProviderProcess;
   readonly supervisorOptions?: ProviderProcessSupervisorOptions;
+  /** Report request-stream failure at the lifecycle owner observation point. */
+  readonly onInputFailure?: (cause: Error) => void;
   /** Let a higher-level owner release its dependent resources before this root. */
   readonly retryCleanup?: () => Promise<void>;
 }
@@ -95,7 +97,6 @@ export class OwnedWorkerRuntime {
   #root: PrivateRuntimeRoot | undefined;
   #cleanupEpoch: OwnedWorkerRuntimeCleanupEpoch | undefined;
   #supervisor: ProviderProcessSupervisor | undefined;
-  #processId: number | null = null;
   #acquisition: Promise<void> | undefined;
   #cleanupRetryAttempt: Promise<void> | undefined;
   #stopAttempt: Promise<ProviderProcessStopResult> | undefined;
@@ -310,7 +311,6 @@ export class OwnedWorkerRuntime {
     });
     this.#inputFailure = undefined;
     this.#observeStdin(spawned.process.stdin);
-    this.#processId = spawned.process.pid ?? null;
     this.#cleanupEpoch.setRunId(spawned.ownership?.runId ?? spawnOptions.runId);
     this.#supervisor = new ProviderProcessSupervisor(
       {
@@ -355,7 +355,6 @@ export class OwnedWorkerRuntime {
     }
     supervisor.dispose();
     this.#supervisor = undefined;
-    this.#processId = null;
     this.#cleanupEpoch?.setRunId(undefined);
     return stopped;
   }
@@ -400,6 +399,7 @@ export class OwnedWorkerRuntime {
         cause instanceof Error
           ? cause
           : new Error("Owned worker request stream failed", { cause });
+      this.options.onInputFailure?.(this.#inputFailure);
     };
     const onClose = (): void => {
       stream.off("error", onError);

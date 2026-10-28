@@ -31,9 +31,12 @@ change.
   unrepresented records, as HAR records without a usable request line are.
 - The response media type is the captured body's `media_type`, or the
   `content-type` header value when only headers were captured.
-- The existing projection representation budget accounts for copied and
-  transformed strings before schema body validation or request-body decoding,
-  including retained Evidence parents. Over-budget captures return
+- The existing projection representation budget reserves, before schema body
+  validation or request-body decoding and for retained and file parents alike,
+  the scratch of validating the largest body (two bytes per base64 character)
+  and the decoded text of every request body; response bodies stay borrowed,
+  as HAR response text does, so a large capture read from its file is not
+  charged per character for them. Over-budget captures return
   `resource_constraint` before those allocations. Replay projection omits the
   request text used only for manifest body-shape inference; retained response
   bytes and their integrity checks are unchanged.
@@ -43,7 +46,9 @@ change.
   transactions with a usable request line retained no response body (tools
   citing them replay only the recorded status and content type, either of
   which may be absent) and how many retained response bodies carry redaction
-  markers. A body that redaction emptied, because a declared secret could not
+  markers. Both counts use the same request-line admission as manifest grouping,
+  so unredacted URLs without a usable transport origin and recorded path contribute
+  to neither numerator nor denominator. A body that redaction emptied, because a declared secret could not
   be cut out, is treated as not retained rather than replayed as an empty
   reply.
 - `environment-serve` and `environment-export` authenticate either parent
@@ -56,7 +61,8 @@ change.
 
 - No new browser action: scenarios still cover what the UI requests plus GET
   reads through `goto`. A fetch or script action would be a new effect and
-  needs its own scope decision.
+  needs its own scope decision. (The `request` action was later scoped and
+  added by [environment-prompt](../environment-prompt/spec.md).)
 - No change to what the scenario redacts. Values the application returns in
   response bodies are retained, as they are in HAR captures.
 - The api-surface view keeps HAR parents only.

@@ -2,14 +2,12 @@ import { desktopPathConventions } from "../domain/nativeConvention.js";
 import { isAbsolute } from "node:path";
 import {
   DirectoryArtifactReader,
+  DirectoryArtifactRootFailure,
   DirectoryArtifactTraversalLimit,
   type DirectoryArtifactEntry,
 } from "./DirectoryArtifactReader.js";
 import { ArtifactReaderFailure } from "./ArtifactReader.js";
-import {
-  ArtifactFileCancelled,
-  ArtifactFileCleanupFailure,
-} from "./ArtifactFileOperation.js";
+import { artifactFileCompletion } from "./ArtifactFileOperation.js";
 import {
   ArtifactResourceScope,
   type ArtifactResourceOwner,
@@ -32,8 +30,16 @@ import { projectDesktopApplication } from "../domain/desktopApplicationProjectio
 import { digestCanonicalValue } from "../domain/canonicalDigest.js";
 import { err, ok } from "../domain/result.js";
 import { createDesktopApplicationEvidence } from "../domain/desktopApplicationEvidence.js";
-import { ARTIFACT_GRAPH_PROVIDER } from "../application/InvestigationProviders.js";
-import { AnalysisResourceConstraintError } from "../domain/analysisErrorCore.js";
+import { ARTIFACT_GRAPH_PROVIDER } from "../domain/investigationProviders.js";
+import {
+  AnalysisResourceConstraintError,
+  AnalysisUnsupportedTargetError,
+} from "../domain/analysisErrorCore.js";
+import type {
+  AnalysisError,
+  AnalysisPartialObservation,
+} from "../domain/analysisErrorBase.js";
+import { BinaryTargetError } from "../domain/configurationErrors.js";
 
 const RETAINED_METADATA_BYTES = 32 * 1024 * 1024;
 
@@ -141,6 +147,8 @@ export class DesktopApplicationReader implements DesktopApplicationPort {
       throw this.#resources.cleanupFailure(outcome, [closed], partial);
     if (outcome.kind === "failed") {
       const cause = outcome.cause;
+      if (cause instanceof DirectoryArtifactRootFailure)
+        throw selectedRootFailure(input.path, cause, partial);
       if (!(cause instanceof ArtifactReaderFailure) || partial === undefined)
         throw cause;
       throw new ArtifactReaderFailure(
@@ -166,6 +174,33 @@ export class DesktopApplicationReader implements DesktopApplicationPort {
     return outcome.value;
   }
 }
+
+/**
+ * The root is the caller's selection: a non-directory is an unsupported
+ * target, and host failures keep the shared target-unavailable/access-denied
+ * classification instead of becoming artifact I/O faults.
+ */
+const selectedRootFailure = (
+  path: string,
+  failure: DirectoryArtifactRootFailure,
+  partialObservation: AnalysisPartialObservation | undefined,
+): AnalysisError =>
+  failure.reason === "path"
+    ? new AnalysisUnsupportedTargetError(
+        "inspect_desktop_application",
+        path,
+        failure.message,
+        {
+          cause: failure,
+          partialObservation,
+          remediationAction:
+            "Select the application's local installation directory, such as a macOS .app bundle or the directory containing its executable.",
+        },
+      )
+    : new BinaryTargetError(path, failure.message, {
+        cause: failure.cause,
+        partialObservation,
+      });
 
 const scanDirectory = async (
   reader: DirectoryArtifactReader,
@@ -233,6 +268,12 @@ const scanDirectory = async (
           kind: omission.kind,
         });
       },
+      onCoverage: (coverage) => {
+        if (coverage.examinedEntries !== undefined)
+          entries = coverage.examinedEntries;
+        if (coverage.status !== "complete") partial = true;
+        limitations.push(...coverage.limitations);
+      },
     })) {
       entries++;
       abortIfNeeded(signal);
@@ -286,10 +327,7 @@ const scanDirectory = async (
         row.read_status = "unavailable";
         row.issues.push(cause.message);
         partial = true;
-        const completedRead =
-          cause instanceof ArtifactFileCancelled ||
-          (cause instanceof ArtifactFileCleanupFailure &&
-            cause.fileCleanupFailure.outcome.kind === "completed");
+        const completedRead = artifactFileCompletion(cause) !== undefined;
         if (completedRead)
           row.read_status = probeIssueCount === 0 ? "examined" : "partial";
         if (
@@ -438,6 +476,6 @@ const addPathFacts = (row: DesktopFile): string | null => {
 
 const probeSelected = (entry: DirectoryArtifactEntry): boolean =>
   entry.executable ||
-  /(?:\.(?:exe|dll|so|dylib|pck|utoc)|(?:^|\/)global-metadata\.dat|(?:^|\/)data\.win)$/iu.test(
+  /(?:\.(?:exe|dll|so|dylib|pck|utoc|bundle|ab|unity3d)|(?:^|\/)(?:global-metadata\.dat|data\.win|game\.(?:unx|ios)))$/iu.test(
     entry.path,
   );

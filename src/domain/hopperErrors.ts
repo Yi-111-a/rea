@@ -60,10 +60,37 @@ export class HopperTimeoutError extends HopperError {
 export class HopperCancelledError extends HopperError {
   readonly _tag = "HopperCancelledError";
 
-  constructor() {
-    super("Hopper operation was cancelled");
+  constructor(
+    ...parameters:
+      | readonly []
+      | readonly [cause: unknown]
+      | readonly [cause: unknown, options: Omit<AnalysisErrorOptions, "cause">]
+  ) {
+    const errorOptions: AnalysisErrorOptions = { ...parameters[1] };
+    // Argument presence matters: an explicit undefined is the caller's reason.
+    if (parameters.length > 0)
+      Object.defineProperty(errorOptions, "cause", {
+        configurable: true,
+        enumerable: true,
+        value: parameters[0],
+        writable: true,
+      });
+    super("Hopper operation was cancelled", errorOptions);
   }
 }
+
+/**
+ * Classify caller cancellation from a signal.
+ *
+ * An aborted signal keeps its exact reason, including undefined. A signal that
+ * has not aborted does not invent a reason.
+ */
+export const hopperCancelledBySignal = (
+  signal: AbortSignal | undefined,
+): HopperCancelledError =>
+  signal?.aborted === true
+    ? new HopperCancelledError(signal.reason)
+    : new HopperCancelledError();
 
 /** Hopper returned bytes or JSON that do not satisfy the NDJSON RPC contract. */
 export class HopperProtocolError extends HopperError {
@@ -151,12 +178,24 @@ export class HopperProcessError extends HopperError {
 }
 
 /** Parsed facts about rejecting an application before execution. */
-export interface HopperLaunchRejection {
-  /** The selected application was rejected before it was executed. */
-  readonly boundary: "publisher_verification";
-  /** Parsed failure reason supplied by the verification owner. */
-  readonly reason: string;
-}
+export type HopperLaunchRejection =
+  | {
+      /** The selected application was rejected before it was executed. */
+      readonly boundary: "publisher_verification";
+      /** Parsed failure reason supplied by the verification owner. */
+      readonly reason: string;
+    }
+  | ({
+      readonly boundary: "argument_encoding";
+      readonly reason: "applescript_literal";
+    } & (
+      | { readonly source: "launcher_path" }
+      | {
+          readonly source: "argument";
+          /** Zero-based index in the final vendor argv, excluding the executable. */
+          readonly argument_index: number;
+        }
+    ));
 
 /** Hopper or the repository bridge could not be started. */
 export class HopperStartError extends HopperError {
@@ -167,7 +206,7 @@ export class HopperStartError extends HopperError {
   readonly launchRejection: HopperLaunchRejection | undefined;
 
   constructor(
-    options?: ErrorOptions & {
+    options?: AnalysisErrorOptions & {
       readonly userMessage?: string;
       readonly ownerRunId?: string;
       readonly launcherFailure?: HopperLauncherOutcome;

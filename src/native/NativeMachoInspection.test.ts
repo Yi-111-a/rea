@@ -143,6 +143,96 @@ describe("Mach-O tool architecture selection", () => {
   );
 });
 
+describe("Mach-O inspection container format", () => {
+  const runInspection = async (lipo: string) => {
+    const runner = new NativeFixtureRunner({ lipo });
+    return inspectNativeMacho({
+      target: nativeMachoTarget("/fixture/app"),
+      run: (tool, args) => runner.run(tool, args),
+      invocation: (capture) => ({
+        tool: capture.tool,
+        command: [capture.executable, ...capture.arguments],
+        tool_version: capture.toolVersion,
+        version_reason: capture.versionReason,
+        executable_sha256: capture.executableSha256,
+        exit: { code: capture.exitCode, signal: capture.signal },
+        stdout_bytes: capture.stdoutBytes,
+        stderr_bytes: capture.stderrBytes,
+      }),
+    });
+  };
+
+  it.each([
+    {
+      framing: "one-slice FAT",
+      lipo: `Fat header in: /fixture/app\nfat_magic 0xcafebabe\nnfat_arch 1\narchitecture arm64\n cputype CPU_TYPE_ARM64\n cpusubtype CPU_SUBTYPE_ARM64_ALL\n offset 4096\n size 128\n align 2^12\n`,
+      expected: "mach-o-universal",
+    },
+    {
+      framing: "thin",
+      lipo: "Non-fat file: /fixture/app is architecture: arm64\n",
+      expected: "mach-o",
+    },
+  ] as const)("reports parsed $framing framing", async ({ lipo, expected }) => {
+    const result = await runInspection(lipo);
+    if (!result.ok) throw result.error;
+    expect(result.value.result).toMatchObject({ format: expected });
+  });
+
+  it("does not call a lazy-info payload dependency exhaustive", async () => {
+    const runner = new NativeFixtureRunner({
+      lipo: "Non-fat file: /fixture/app is architecture: arm64\n",
+      "otool:-h": withOtoolMachHeader(
+        [
+          "Load command 0",
+          "      cmd LC_LOAD_DYLIB",
+          "  cmdsize 56",
+          "         name /usr/lib/libSystem.B.dylib (offset 24)",
+          "   time stamp 2 Thu Jan  1 00:00:02 1970",
+          "      current version 1.0.0",
+          "compatibility version 1.0.0",
+          "Load command 1",
+          "      cmd LC_LAZY_LOAD_DYLIB_INFO",
+          "  cmdsize 16",
+          "    dataoff 49304",
+          "   datasize 56",
+        ].join("\n"),
+      ),
+    });
+    const result = await inspectNativeMacho({
+      target: nativeMachoTarget("/fixture/app"),
+      run: (tool, args) => runner.run(tool, args),
+      invocation: (captured) => ({
+        tool: captured.tool,
+        command: [captured.executable, ...captured.arguments],
+        tool_version: captured.toolVersion,
+        version_reason: captured.versionReason,
+        executable_sha256: captured.executableSha256,
+        exit: { code: captured.exitCode, signal: captured.signal },
+        stdout_bytes: captured.stdoutBytes,
+        stderr_bytes: captured.stderrBytes,
+      }),
+    });
+    if (!result.ok) throw result.error;
+    expect(result.value.result).toMatchObject({
+      load_commands: {
+        items: [{ kind: "LC_LOAD_DYLIB" }, { kind: "LC_LAZY_LOAD_DYLIB_INFO" }],
+      },
+      dependencies: {
+        exhaustive: false,
+        total: null,
+        items: [
+          {
+            path: "/usr/lib/libSystem.B.dylib",
+            kind: "LC_LOAD_DYLIB",
+          },
+        ],
+        limitations: [expect.stringContaining("1 LC_LAZY_LOAD_DYLIB_INFO")],
+      },
+    });
+  });
+});
+
 describe("Mach-O UUID reconciliation", () => {
   const validUuid = "01234567-89AB-CDEF-0123-456789ABCDEF";
 
@@ -311,5 +401,168 @@ describe("Mach-O slice command scheduling", () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.error).toMatchObject({ reason: "nm failed" });
+  });
+});
+
+it.each(["10", "DSYM", "2"])(
+  "classifies the unbacked-text dyld refusal using observed file type %s",
+  async (fileType) => {
+    const diagnostic =
+      "section '__TEXT/__text' has offset=0 but is not a zero-fill section type\n";
+    const runner = new NativeFixtureRunner({
+      otool: [
+        "Mach header",
+        "magic cputype cpusubtype caps filetype ncmds sizeofcmds flags",
+        `0xfeedfacf 16777228 0 0x00 ${fileType} 0 0 0x0`,
+      ].join("\n"),
+    });
+    const result = await inspectNativeMacho({
+      target: nativeMachoTarget("/fixture/debug-companion"),
+      run: async (tool, args, _signal, acceptNonZeroIf) => {
+        const captured = await runner.run(tool, args);
+        if (!captured.ok || tool !== "dyld_info") return captured;
+        const refused = {
+          ...captured.value,
+          stdout: diagnostic,
+          stdoutBytes: Buffer.byteLength(diagnostic),
+          exitCode: 1,
+        };
+        if (acceptNonZeroIf?.(refused)) return ok(refused);
+        return err(
+          new AnalysisOutputError("inspect_macho", "unaccepted native failure"),
+        );
+      },
+      invocation: () => {
+        throw new Error(
+          "Refused target does not produce inspection provenance",
+        );
+      },
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error._tag).toBe(
+      fileType === "2"
+        ? "AnalysisOutputError"
+        : "AnalysisUnsupportedTargetError",
+    );
+    expect(result.error.capturedOutput).toMatchObject({
+      stdout: diagnostic,
+      exit_code: 1,
+    });
+  },
+);
+
+describe("dSYM diagnostic admission", () => {
+  const diagnostic =
+    "section '__TEXT/__text' has offset=0 but is not a zero-fill section type";
+
+  it.each([
+    { name: "stdout refusal", stdout: diagnostic, stderr: "", accepted: true },
+    { name: "stderr refusal", stdout: "", stderr: diagnostic, accepted: true },
+    {
+      name: "echoed path and prefixed refusal",
+      stdout: `/fixture/debug-companion:\n\ndyld_info: ${diagnostic}\n`,
+      stderr: "",
+      accepted: true,
+    },
+    {
+      name: "unrelated stdout after refusal",
+      stdout: `${diagnostic}\nmalformed load command`,
+      stderr: "",
+      accepted: false,
+    },
+    {
+      name: "unrelated stdout before refusal",
+      stdout: `malformed load command\n${diagnostic}`,
+      stderr: "",
+      accepted: false,
+    },
+    {
+      name: "unrelated stderr beside stdout refusal",
+      stdout: diagnostic,
+      stderr: "malformed load command",
+      accepted: false,
+    },
+    {
+      name: "unrelated stdout beside stderr refusal",
+      stdout: "malformed load command",
+      stderr: diagnostic,
+      accepted: false,
+    },
+    {
+      name: "unrelated stderr after refusal",
+      stdout: "",
+      stderr: `${diagnostic}\nmalformed load command`,
+      accepted: false,
+    },
+    {
+      name: "missing UUID before dSYM refusal",
+      stdout: `missing LC_UUID load command\n${diagnostic}`,
+      stderr: "",
+      accepted: false,
+    },
+    {
+      name: "missing UUID beside stderr dSYM refusal",
+      stdout: "missing LC_UUID load command",
+      stderr: diagnostic,
+      accepted: false,
+    },
+    {
+      name: "duplicate refusal across streams",
+      stdout: diagnostic,
+      stderr: diagnostic,
+      accepted: false,
+    },
+  ])("preserves $name", async ({ stdout, stderr, accepted }) => {
+    const runner = new NativeFixtureRunner({
+      otool: [
+        "Mach header",
+        "magic cputype cpusubtype caps filetype ncmds sizeofcmds flags",
+        "0xfeedfacf 16777228 0 0x00 10 0 0 0x0",
+      ].join("\n"),
+    });
+    const result = await inspectNativeMacho({
+      target: nativeMachoTarget("/fixture/debug-companion"),
+      run: async (tool, args, _signal, acceptNonZeroIf) => {
+        const captured = await runner.run(tool, args);
+        if (!captured.ok || tool !== "dyld_info") return captured;
+        const refused = {
+          ...captured.value,
+          stdout,
+          stderr,
+          stdoutBytes: Buffer.byteLength(stdout),
+          stderrBytes: Buffer.byteLength(stderr),
+          exitCode: 1,
+        };
+        return acceptNonZeroIf?.(refused)
+          ? ok(refused)
+          : err(
+              new AnalysisOutputError("inspect_macho", "native refusal", {
+                capturedOutput: {
+                  stdout,
+                  stderr,
+                  truncated: false,
+                  stdout_bytes: refused.stdoutBytes,
+                  stderr_bytes: refused.stderrBytes,
+                  exit_code: 1,
+                  signal: null,
+                },
+              }),
+            );
+      },
+      invocation: () => {
+        throw new Error("Refused target does not produce provenance");
+      },
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error._tag).toBe(
+      accepted ? "AnalysisUnsupportedTargetError" : "AnalysisOutputError",
+    );
+    expect(result.error.capturedOutput).toMatchObject({
+      stdout,
+      stderr,
+      exit_code: 1,
+    });
   });
 });

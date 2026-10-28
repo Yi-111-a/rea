@@ -9,7 +9,10 @@ import {
   AnalysisResourceConstraintError,
 } from "./analysisErrorCore.js";
 import { ArtifactOperationError } from "./artifactOperationError.js";
-import { BinaryTargetError } from "./configurationErrors.js";
+import {
+  BinaryTargetError,
+  ConfigurationError,
+} from "./configurationErrors.js";
 import { BrowserObservationError } from "./browserObservationError.js";
 import { EvidenceFileError, EvidenceIntegrityError } from "./evidenceErrors.js";
 import {
@@ -24,6 +27,128 @@ import { projectAnalysisError } from "./analysisErrorProjection.js";
 import { ProviderSelectionError } from "./providerSelectionError.js";
 import { analysisErrorProjectionSchema } from "../contracts/errorSchemas.js";
 import { nativeCallPartialObservationSchema } from "./native/nativeCallPartialObservation.js";
+
+describe("agent recovery metadata", () => {
+  it("does not mark deterministic input validation as retryable", () => {
+    const projected = projectAnalysisError(
+      new AnalysisInputError("extract_firmware", undefined, [
+        { path: ["range", "length"], reason: "missing_argument" },
+      ]),
+    );
+
+    expect(projected).toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      remediation: {
+        action: expect.stringContaining("Do not repeat the unchanged call."),
+      },
+    });
+    expect(analysisErrorProjectionSchema.parse(projected)).toEqual(projected);
+  });
+
+  it("distinguishes deterministic duplicate identities from stale update revisions", () => {
+    const duplicate = projectAnalysisError(
+      new UnknownRegistryError("already-exists"),
+    );
+    expect(duplicate).toMatchObject({
+      code: "invalid_request",
+      category: "invalid_input",
+      retryable: false,
+      details: { reason: "already-exists" },
+      remediation: {
+        action: expect.stringContaining("do not repeat record_unknown"),
+      },
+    });
+    expect(analysisErrorProjectionSchema.parse(duplicate)).toEqual(duplicate);
+    expect(
+      projectAnalysisError(new UnknownRegistryError("revision-conflict")),
+    ).toMatchObject({ code: "revision_conflict", retryable: true });
+  });
+
+  it.each(["history_gap", "revision_chain"] as const)(
+    "preserves %s as an integrity failure with producer facts",
+    (kind) => {
+      const constraint = { kind, unknown_id: `unk_${"0".repeat(64)}` };
+      const projected = projectAnalysisError(
+        new UnknownRegistryError(constraint, {
+          cause: new Error("Unrelated private diagnostic"),
+        }),
+      );
+      expect(projected).toMatchObject({
+        code: "evidence_integrity_mismatch",
+        retryable: false,
+        details: { reason: "integrity", constraint },
+      });
+      expect(projected.message).toContain(constraint.unknown_id);
+      expect(JSON.stringify(projected)).not.toContain(
+        "Unrelated private diagnostic",
+      );
+      expect(analysisErrorProjectionSchema.parse(projected)).toEqual(projected);
+    },
+  );
+
+  it("keeps retryability for transient conflicts and provider timeouts", () => {
+    expect(
+      projectAnalysisError(new UnknownRegistryError("revision-conflict")),
+    ).toMatchObject({ code: "revision_conflict", retryable: true });
+    expect(
+      projectAnalysisError(
+        new AnalysisTimeoutError("inspect_binary_layout", 2500),
+      ),
+    ).toMatchObject({ code: "provider_timeout", retryable: true });
+  });
+
+  it("names the input contract for malformed analysis arguments", () => {
+    const projected = projectAnalysisError(
+      new AnalysisInputError("inspect_analysis_view", undefined, [
+        {
+          path: ["view", "kind"],
+          reason: "invalid_value",
+          expected: ["summary", "module"],
+        },
+      ]),
+    );
+
+    expect(projected).toMatchObject({
+      recovery: {
+        kind: "inspect_input_contract",
+        operation: "inspect_analysis_view",
+      },
+      remediation: {
+        action:
+          "Read the declared input schema or CLI usage for inspect_analysis_view; if using MCP and the catalog may be stale, call tools/list. Correct the listed fields, then retry. Do not repeat the unchanged call.",
+      },
+    });
+    expect(analysisErrorProjectionSchema.parse(projected)).toEqual(projected);
+  });
+
+  it("separates timeout-state inspection from client deadline recovery", () => {
+    const projected = projectAnalysisError(
+      new AnalysisTimeoutError("inspect_binary_layout", 2_500),
+    );
+
+    expect(projected).toMatchObject({
+      code: "provider_timeout",
+      recovery: {
+        kind: "inspect_timeout_state",
+        operation: "inspect_binary_layout",
+        timeout_ms: 2_500,
+      },
+      message: expect.stringContaining("server/provider deadline"),
+      remediation: {
+        action: expect.stringContaining("provider diagnostics"),
+      },
+    });
+    expect(projected.message).toContain("not a client-side timeout");
+    expect(projected.remediation.action).not.toContain(
+      "raise its tool deadline",
+    );
+    expect(projected.remediation.action).not.toMatch(
+      /declared timeout controls|larger server\/provider budget|without assuming adjustable limits|do not assume adjustable/u,
+    );
+    expect(analysisErrorProjectionSchema.parse(projected)).toEqual(projected);
+  });
+});
 
 describe("capability failure retry disposition", () => {
   it.each([
@@ -199,6 +324,32 @@ it("distinguishes unsupported target formats from unavailable provider capabilit
   expect(projected.remediation.action).toContain("target format");
   expect(projected.remediation.action).not.toContain("doctor");
   expect(analysisErrorProjectionSchema.safeParse(projected).success).toBe(true);
+});
+
+it("keeps a refusing provider's recovery on a target selection failure", () => {
+  const selection = {
+    reason: "target_unsupported" as const,
+    requestedProviderId: "ghidra",
+    candidateIds: ["ghidra"],
+    userMessage: "Unsupported target: the configured extension is x86-64 only.",
+  };
+  expect(
+    projectAnalysisError(
+      new ProviderSelectionError({
+        ...selection,
+        remediationAction: "Omit the extension setting for this target.",
+      }),
+    ),
+  ).toMatchObject({
+    code: "capability_unavailable",
+    message: selection.userMessage,
+    remediation: { action: "Omit the extension setting for this target." },
+    details: { selection_reason: "target_unsupported" },
+  });
+  expect(
+    projectAnalysisError(new ProviderSelectionError(selection)).remediation
+      .action,
+  ).toBe(selection.userMessage);
 });
 
 it.each([false, true])(
@@ -442,6 +593,83 @@ describe("analysis error projection: browser provider failures", () => {
         resources: ["browser_transport"],
         primary_reason: "target_changed",
       },
+    });
+  });
+
+  it("keeps producer facts when a browser failure is attributed to another operation", () => {
+    const partial = { kind: "browser-test-partial" } as never;
+    const original = new BrowserObservationError(
+      "inspect_web_page",
+      "cleanup_failed",
+      {
+        detail: "Target page-1 closed while REA released its session.",
+        remediationAction: "Release session page-1, then retry.",
+        cleanup: { reason: "socket close failed", resources: ["page-1"] },
+        diagnostics: { endpoint: "loopback" },
+        partialObservation: partial,
+        cause: new AggregateError([
+          new BrowserObservationError("inspect_web_page", "target_changed"),
+          new Error("socket close failed"),
+        ]),
+      },
+    );
+    const relabelled = original.forOperation("capture_web_screenshot");
+
+    expect(relabelled).toMatchObject({
+      operation: "capture_web_screenshot",
+      reason: "cleanup_failed",
+      cause: original.cause,
+      diagnostics: { endpoint: "loopback" },
+      partialObservation: partial,
+    });
+    const { details, ...projected } = projectAnalysisError(relabelled);
+    const { details: originalDetails, ...originalProjected } =
+      projectAnalysisError(original);
+    expect(projected).toEqual(originalProjected);
+    expect(projected).toMatchObject({
+      code: "cleanup_incomplete",
+      message: "Target page-1 closed while REA released its session.",
+      remediation: { action: "Release session page-1, then retry." },
+    });
+    expect(details).toEqual({
+      ...originalDetails,
+      operation: "capture_web_screenshot",
+    });
+    expect(details).toMatchObject({
+      resources: ["page-1"],
+      primary_reason: "target_changed",
+    });
+  });
+
+  it("derives default browser guidance for the attributed operation", () => {
+    const original = new BrowserObservationError(
+      "inspect_web_page",
+      "target_not_found",
+    );
+    expect(original.forOperation("inspect_web_page")).toBe(original);
+
+    const relabelled = original.forOperation("discover_webmcp_tools");
+    const projected = projectAnalysisError(relabelled);
+    expect(projected).toMatchObject({
+      code: "target_unavailable",
+      message: expect.stringMatching(/^discover_webmcp_tools could not find/),
+      details: {
+        operation: "discover_webmcp_tools",
+        reason: "target_not_found",
+      },
+    });
+    expect(projected.message).not.toContain("inspect_web_page");
+    expect(
+      projectAnalysisError(
+        new BrowserObservationError("inspect_web_page", "timeout").forOperation(
+          "observe_web_session",
+        ),
+      ),
+    ).toMatchObject({
+      code: projectAnalysisError(
+        new BrowserObservationError("observe_web_session", "timeout"),
+      ).code,
+      details: { operation: "observe_web_session", reason: "timeout" },
     });
   });
 });
@@ -815,6 +1043,7 @@ describe("analysis error projection: evidence files", () => {
     ["read", "not-file", "invalid_request", "invalid_input"],
     ["write", "missing", "invalid_request", "invalid_input"],
     ["write", "exists", "invalid_request", "invalid_input"],
+    ["write", "path-limit", "resource_constraint", "resource_constraint"],
     [
       "read",
       "invalid-json",
@@ -907,3 +1136,83 @@ it.each([false, true])(
     );
   },
 );
+
+it("retains Hopper startup diagnostics beside generic and secondary context", () => {
+  const diagnostic = {
+    component: "hopper_private_display",
+    operation: "launch",
+    reason: "fixture_denial",
+    socket_directory: "/tmp/.X11-unix",
+    socket_directory_mode: null,
+    mount_read_only: null,
+    effective_socket_directory_mode: null,
+    effective_mount_read_only: null,
+    wsl: false,
+    strategy: "unavailable",
+    fallback_reason: null,
+    xvfb_stderr_bytes: 0,
+    status: "error",
+    failure_code: "private_display_unavailable",
+  } as const;
+  expect(
+    projectAnalysisError(new HopperProcessError(null, { diagnostic })).details
+      ?.diagnostics,
+  ).toEqual(diagnostic);
+  const generic = { caller_context: "retained" };
+  expect(
+    projectAnalysisError(
+      new HopperProcessError(null, { diagnostic, diagnostics: generic }),
+    ),
+  ).toMatchObject({
+    code: "provider_unavailable",
+    details: { diagnostics: generic, provider_diagnostics: diagnostic },
+  });
+  const secondary = new HopperProcessError(null, {
+    diagnostic,
+  }).retainSecondaryFailure(new HopperProcessError(null), {
+    retirement_error: "retained",
+  });
+  expect(projectAnalysisError(secondary).details).toMatchObject({
+    provider_diagnostics: diagnostic,
+    diagnostics: { retirement_error: "retained" },
+  });
+});
+
+it("does not offer entry-policy retries for integrity refusals without a declared-versus-observed entry contradiction", () => {
+  const native = projectAnalysisError(
+    new ArtifactOperationError(
+      "inspect_artifact",
+      "integrity",
+      undefined,
+      "hdiutil verify failed: invalid checksum",
+    ),
+  );
+  expect(native.category).toBe("integrity_mismatch");
+  expect(native.details).toMatchObject({
+    reason: "integrity",
+    detail: "hdiutil verify failed: invalid checksum",
+  });
+  expect(native.message).not.toContain("record-and-continue");
+  expect(native.remediation.action).not.toContain("record-and-continue");
+});
+
+it("preserves ordinary configuration recovery and projects a producer-owned session repair", () => {
+  const settings = [{ setting: "REA_EXAMPLE", constraint: "must be positive" }];
+  const original = projectAnalysisError(
+    new ConfigurationError("Invalid setting", { settings }),
+  );
+  const repairing = projectAnalysisError(
+    new ConfigurationError("Invalid setting", {
+      settings,
+      remediationAction: "Repair the running session, then retry.",
+    }),
+  );
+  expect(original.remediation.action).toBe(
+    "Correct REA_EXAMPLE in the environment that starts REA (your shell or the MCP client's registration), then rerun.",
+  );
+  expect(repairing).toEqual({
+    ...original,
+    remediation: { action: "Repair the running session, then retry." },
+  });
+  expect(repairing.code).toBe("configuration_invalid");
+});

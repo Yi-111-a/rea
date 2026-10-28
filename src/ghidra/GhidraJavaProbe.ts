@@ -6,7 +6,7 @@ import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
 import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
-import type { FileCloseResourceOwner } from "../application/AnalysisProvider.js";
+import type { RetainedResourceScope } from "../application/AnalysisProvider.js";
 import { DarwinProcessOwnershipInspectionError } from "../process/DarwinProcessRunTokenReader.js";
 import {
   OwnedCommandFailure,
@@ -110,7 +110,7 @@ const executablePath = (path: string): boolean => {
   }
 };
 export interface GhidraJavaProbeOptions {
-  readonly resourceOwner: FileCloseResourceOwner;
+  readonly resourceOwner: RetainedResourceScope;
   readonly signal?: AbortSignal;
   readonly launcher?: NonNullable<
     Parameters<typeof runOwnedCommand>[2]
@@ -373,9 +373,12 @@ export const parseGhidraJavaOutput = (
       : "jre",
   });
 };
+// OpenJDK LauncherHelper prints indentation, the property name, " = ", then
+// the scalar value verbatim. Only the one separator space belongs to framing;
+// further whitespace is part of the value, including for filesystem paths.
 const javaProperty = (output: string, name: string): string | null =>
   new RegExp(
-    `^[ \\t]*${name.replaceAll(".", "\\.")}[ \\t]*=[ \\t]*([^\\r\\n]*?)[ \\t]*\\r?$`,
+    `^[ \\t]*${name.replaceAll(".", "\\.")} = ([^\\r\\n]*)\\r?$`,
     "mu",
   ).exec(output)?.[1] ?? null;
 

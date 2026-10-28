@@ -1,6 +1,6 @@
-import { AnalysisAccessDeniedError } from "./analysisErrorCore.js";
-import { expect, it } from "vitest";
+import { EvidenceFileError } from "./evidenceErrors.js";
 import {
+  AnalysisAccessDeniedError,
   AnalysisInputError,
   AnalysisCapabilityUnavailableError,
   AnalysisCancelledError,
@@ -9,11 +9,13 @@ import {
   AnalysisOutputError,
   AnalysisResourceConstraintError,
 } from "./analysisErrorCore.js";
+import { expect, it } from "vitest";
 import { projectAnalysisError } from "./analysisErrorProjection.js";
 import { ProviderCleanupError } from "./providerCleanupError.js";
 import { ProviderAdapterError } from "./providerAdapterError.js";
 import { analysisErrorWithCleanupFailure } from "./analysisErrorCleanup.js";
 import { resolvedAnalysisError } from "./analysisErrorBase.js";
+import { createEvidence } from "./evidence.js";
 import {
   redactExplicitFailure,
   redactExplicitPointer,
@@ -55,7 +57,20 @@ it.each([
   ),
   new ProviderAdapterError("provider", "inspect", context),
 ])("preserves sanitized common context for $._tag", (error) => {
+  const observation = createEvidence(
+    undefined,
+    { id: "fixture", name: "Owner facts", version: "1" },
+    {
+      operation: "inspect",
+      parameters: {},
+      result: { source: "already sanitized owner facts" },
+      confidence: "observed",
+      authority: "historical-reference",
+    },
+  );
+  error.retainPartialObservation(observation);
   const sanitized = redactExplicitFailure(error, ["explicit-secret"]);
+  expect(sanitized.partialObservation).toBe(observation);
   expect(sanitized._tag).toBe(error._tag);
   const projected = projectAnalysisError(sanitized);
   expect(projected.details).toMatchObject({
@@ -150,6 +165,26 @@ it("redacts cleanup primaries and mirrors the source error's live status", () =>
       },
     ],
   });
+});
+
+it("keeps a named timeout control through explicit-value redaction", () => {
+  const error = new AnalysisTimeoutError(
+    "analyze_javascript_application",
+    300000,
+    {
+      userMessage:
+        "JavaScript source analysis reached its 300000ms per-source server/provider deadline (analysis_timeout_ms) for explicit-secret, not the MCP client deadline.",
+      remediationAction:
+        "Increase analysis_timeout_ms through MCP for explicit-secret, or use rea analyze-javascript-application <input_path> --analysis-timeout-ms <milliseconds> on the CLI.",
+    },
+  );
+  const redacted = redactExplicitFailure(error, ["explicit-secret"]);
+  const projected = projectAnalysisError(redacted);
+  expect(projected.message).toContain("analysis_timeout_ms");
+  expect(projected.message).toContain("300000");
+  expect(projected.remediation.action).toContain("analysis_timeout_ms");
+  expect(projected.remediation.action).toContain("--analysis-timeout-ms");
+  expect(JSON.stringify(projected)).not.toContain("explicit-secret");
 });
 
 it("keeps unsupported profile reasons distinct from malformed input", () => {
@@ -249,4 +284,26 @@ it("does not reinterpret an unknown argument name as a JSON pointer", () => {
   if (!(result instanceof AnalysisInputError))
     throw new Error("Input error required");
   expect(result.issues[0]?.path).toEqual([]);
+});
+
+it("preserves completed publication and live cleanup while excluding marked file identities", () => {
+  const original = new EvidenceFileError("write", "io", {
+    path: "/private-marker/output.json",
+    published: { path: "/private-marker/output.json", bytes: 42 },
+    cleanup: {
+      reason: "private-marker staging failed",
+      resources: ["/private-marker/stage"],
+    },
+  });
+  const redacted = redactExplicitFailure(original, ["private-marker"]);
+  const projected = projectAnalysisError(redacted);
+  expect(projected).toMatchObject({
+    code: "cleanup_incomplete",
+    details: { published: true, bytes: 42 },
+  });
+  expect(projected.details).not.toHaveProperty("path");
+  expect(projected.details).not.toHaveProperty("published_path");
+  expect(JSON.stringify(projected)).not.toContain("private-marker");
+  original.resolveCleanup();
+  expect(redacted.cleanupIncomplete).toBe(false);
 });

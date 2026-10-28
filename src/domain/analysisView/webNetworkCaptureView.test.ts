@@ -1,6 +1,7 @@
 import { expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import { createEvidence } from "../evidence.js";
+import { freezeJsonSnapshot } from "../immutableJson.js";
 import { webNetworkCaptureSchema } from "../webNetworkCapture.js";
 import { projectAnalysisView } from "./analysisView.js";
 
@@ -77,6 +78,29 @@ const capture = () => {
   };
 };
 
+it("checks each parent's subject even after its immutable capture has been validated", () => {
+  const { parent } = capture();
+  const source = {
+    ...parent,
+    normalizedResult: freezeJsonSnapshot(parent.normalizedResult),
+  };
+  expect(projectAnalysisView(source, { kind: "summary" }).ok).toBe(true);
+  expect(
+    projectAnalysisView({ ...source, subject: null }, { kind: "summary" }).ok,
+  ).toBe(false);
+  if (source.subject === null) throw new Error("Expected fixture subject");
+  expect(
+    projectAnalysisView(
+      {
+        ...source,
+        subject: { ...source.subject, digest: { sha256: "e".repeat(64) } },
+      },
+      { kind: "summary" },
+    ).ok,
+  ).toBe(false);
+  expect(projectAnalysisView(source, { kind: "summary" }).ok).toBe(true);
+});
+
 it("keeps selected-record page coverage distinct from capture coverage and unsafe number absence", () => {
   const { parent, report } = capture();
   const summary = projectAnalysisView(parent, { kind: "summary" });
@@ -130,7 +154,7 @@ it("keeps selected-record page coverage distinct from capture coverage and unsaf
   });
 });
 
-it("retains explicitly unknown digests and rejects a different subject path", () => {
+it("retains explicitly unknown digests and rejects a different subject digest", () => {
   const { parent, report } = capture();
   const unknown = projectAnalysisView(
     {
@@ -153,7 +177,7 @@ it("retains explicitly unknown digests and rejects a different subject path", ()
   const mismatched = projectAnalysisView(
     {
       ...parent,
-      subject: { ...parent.subject, local_path: "/different/source.saz" },
+      subject: { ...parent.subject, digest: { sha256: "e".repeat(64) } },
     },
     { kind: "summary" },
   );

@@ -1,3 +1,4 @@
+import { projectCliAnalysisResult } from "./projectCliAnalysisResult.js";
 import { z } from "incur";
 import { ApktoolResourceAnalysisService } from "../application/apktool/ApktoolResourceAnalysisService.js";
 import type { ApktoolResourceAnalysisPort } from "../application/apktool/ApktoolResourceAnalysisPort.js";
@@ -32,7 +33,7 @@ export const registerApktoolCommands = (
           "apktool",
           operation,
           signal,
-        ),
+        ).then(projectCliAnalysisResult),
       ),
     );
 
@@ -61,6 +62,8 @@ export const registerApktoolCommands = (
         apktoolInputSchemas.decode_android_resources.shape.locales.describe(
           "Repeat to project multiple localized string tables, e.g. --locales de --locales pt-BR",
         ),
+      decodeTimeoutMs:
+        apktoolInputSchemas.decode_android_resources.shape.decode_timeout_ms,
       strings: z
         .boolean()
         .default(
@@ -81,6 +84,9 @@ export const registerApktoolCommands = (
           : { string_tables_only: options["string-tables-only"] }),
         ...(options.locale === undefined ? {} : { locale: options.locale }),
         ...(options.locales === undefined ? {} : { locales: options.locales }),
+        ...(options.decodeTimeoutMs === undefined
+          ? {}
+          : { decode_timeout_ms: options.decodeTimeoutMs }),
       }),
   });
 };
