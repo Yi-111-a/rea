@@ -492,7 +492,7 @@ const versionProbeFailure = (
       },
     );
   // EPERM is the other errno a refused exec can surface (for example a launcher
-  // on a noexec mount or blocked by a security policy), so it is a permission
+  // blocked by an operating-system security policy), so it is a permission
   // failure like EACCES, not a missing launcher.
   if (
     cause instanceof Error &&
